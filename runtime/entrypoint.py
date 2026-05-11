@@ -27,6 +27,9 @@ import traceback
 
 def main() -> None:
     code = sys.stdin.read()
+    # Strip a UTF-8 BOM (PowerShell pipes one in on Windows; HTTP POSTs don't).
+    if code.startswith("﻿"):
+        code = code[1:]
 
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()

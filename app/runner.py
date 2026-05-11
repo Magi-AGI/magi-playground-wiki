@@ -57,6 +57,10 @@ def _build_docker_command(timeout_s: float) -> list[str]:
     args.extend(["--pids-limit", str(settings.pids_limit)])
     # Writable tmpfs at /tmp (size 64m, mounted noexec).
     args.extend(["--tmpfs", "/tmp:size=64m,mode=1777,noexec,nosuid,nodev"])
+    # Hyperon writes a config dir under $HOME at startup (environment.rs:289 reads/creates
+    # ~/.metta). With --read-only rootfs we need a separate writable tmpfs for HOME.
+    # 16m is plenty for the runner's small bookkeeping files.
+    args.extend(["--tmpfs", "/home/metta:size=16m,mode=0700,uid=1001,gid=1001,nosuid,nodev"])
     # SIGTERM grace period — give the container 1s after the wall clock before SIGKILL.
     # `--stop-timeout` is a soft hint; the asyncio-side timeout enforces the hard kill.
     args.extend(["--stop-timeout", str(max(1, int(timeout_s) + 1))])
