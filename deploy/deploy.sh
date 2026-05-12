@@ -39,7 +39,11 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 usermod -aG docker "$SERVICE_USER"
 
-# 2. Sync code from git.
+# 2. Ensure the repo (and everything inside it) is owned by the service user
+# so subsequent git/pip/build steps can run as that user. Idempotent.
+chown -R "$SERVICE_USER":"$SERVICE_USER" "$REPO_DIR"
+
+# 3. Sync code from git.
 cd "$REPO_DIR"
 sudo -u "$SERVICE_USER" git fetch --all --prune
 sudo -u "$SERVICE_USER" git checkout main
