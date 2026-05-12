@@ -20,7 +20,7 @@ Environment=PATH=/opt/magi-playground-wiki/.venv/bin:/usr/local/bin:/usr/bin:/bi
 ExecStart=/opt/magi-playground-wiki/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 \
     --port 8765 \
-    --workers 2 \
+    --workers 1 \
     --no-access-log \
     --log-level info
 Restart=on-failure
