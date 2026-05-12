@@ -1,0 +1,44 @@
+[Unit]
+Description=Magi Playground Wiki (Hyperon Wiki right-column MeTTa sandbox)
+Documentation=https://github.com/Magi-AGI/magi-playground-wiki
+After=network.target docker.service
+Wants=network.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=magi-playground
+Group=magi-playground
+# Service user MUST also be a member of the `docker` group so `docker run` works
+# without sudo. The deploy script handles this; if you create the user by hand,
+# add: usermod -aG docker magi-playground
+SupplementaryGroups=docker
+WorkingDirectory=/opt/magi-playground-wiki
+EnvironmentFile=-/opt/magi-playground-wiki/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/magi-playground-wiki/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/magi-playground-wiki/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8765 \
+    --workers 2 \
+    --no-access-log \
+    --log-level info
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=magi-playground-wiki
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

@@ -104,9 +104,70 @@ Expected output:
 
 ## Deploy
 
-The FastAPI server runs on the EC2 host alongside Decko/Nginx. Nginx routes `/api/playground/*` to `127.0.0.1:8765`. The host must have a Docker daemon; the sidecar process needs membership in the `docker` group to run `docker run` without sudo.
+Runs as a systemd service on the EC2 host alongside Decko/Nginx. Each request shells out to `docker run` against the pre-built `hyperon-runtime:0.2.10` image. All artifacts live under [`deploy/`](./deploy/):
 
-See `deploy/` (TBD) for systemd unit, Nginx snippet, and Dockerfile for containerizing the FastAPI server itself (DinD/socket-mount).
+| File | Purpose |
+|------|---------|
+| [`magi-playground-wiki.service`](./deploy/magi-playground-wiki.service) | systemd unit — uvicorn under user `magi-playground` (in `docker` group), 2 workers, hardened |
+| [`nginx-rate-limits.conf`](./deploy/nginx-rate-limits.conf) | `http {}`-level rate-limit zones (tiered, 60/min signed-in, 30/min anon) |
+| [`nginx-playground.conf`](./deploy/nginx-playground.conf) | `server {}`-level location block (15s read timeout, 128k body cap) |
+| [`deploy.sh`](./deploy/deploy.sh) | idempotent install/update: git pull → docker build (when runtime/ changed) → venv pip install → restart → health-check |
+
+### First-time install (on the EC2 host, as root)
+
+```bash
+# 1. Clone the repo.
+git clone https://github.com/Magi-AGI/magi-playground-wiki.git /opt/magi-playground-wiki
+
+# 2. (Optional) override defaults via .env. All settings have sensible defaults.
+cp /opt/magi-playground-wiki/.env.example /opt/magi-playground-wiki/.env
+
+# 3. Wire Nginx — load rate-limit zones in http {}, location block in server {}.
+sudo cp /opt/magi-playground-wiki/deploy/nginx-rate-limits.conf \
+        /etc/nginx/conf.d/magi-playground-rate-limits.conf
+sudo cp /opt/magi-playground-wiki/deploy/nginx-playground.conf \
+        /etc/nginx/snippets/magi-playground.conf
+# Then add `include /etc/nginx/snippets/magi-playground.conf;` inside the
+# wiki.hyperon.dev server block, and reload:
+sudo nginx -t && sudo systemctl reload nginx
+
+# 4. Run the deploy script (creates the service user, adds it to docker group,
+#    builds the hyperon-runtime image, installs the systemd unit, starts it).
+sudo bash /opt/magi-playground-wiki/deploy/deploy.sh
+```
+
+### Updates
+
+```bash
+sudo bash /opt/magi-playground-wiki/deploy/deploy.sh
+```
+
+The script git-pulls `main`, rebuilds the `hyperon-runtime` image only when `runtime/Dockerfile` or `runtime/entrypoint.py` changed, refreshes the Python venv, restarts, and curls `/api/playground/health`.
+
+### Observability
+
+```bash
+# Live structured logs.
+journalctl -u magi-playground-wiki -f
+
+# Service status.
+systemctl status magi-playground-wiki
+
+# Smoke test from the host.
+curl -s http://127.0.0.1:8765/api/playground/health | jq
+
+# Prometheus scrape.
+curl -s http://127.0.0.1:8765/metrics | head -20
+
+# End-to-end through Nginx.
+curl -s -X POST https://wiki.hyperon.dev/api/playground/run \
+    -H 'content-type: application/json' \
+    -d '{"code":"!(+ 1 2)"}' | jq
+```
+
+### Rate limit tiers (plan A-9 / B-7)
+
+The two zones in `nginx-rate-limits.conf` use `map` directives to short-circuit whichever zone shouldn't apply: requests with `_hyperon_session` cookie hit only the user zone (60/min), requests without hit only the IP zone (30/min). nginx skips `limit_req` when the key evaluates to an empty string.
 
 ## Layout
 
@@ -124,6 +185,11 @@ magi-playground-wiki/
 ├── runtime/                # contents of the hyperon-runtime:0.2.10 image
 │   ├── Dockerfile          # FROM python:3.11-slim + pip install hyperon
 │   └── entrypoint.py       # in-container MeTTa runner
+├── deploy/
+│   ├── magi-playground-wiki.service   # systemd unit
+│   ├── nginx-rate-limits.conf         # http{} rate-limit zones
+│   ├── nginx-playground.conf          # server{} location block
+│   └── deploy.sh                      # install/update script
 └── tests/
     └── test_run.py
 ```
