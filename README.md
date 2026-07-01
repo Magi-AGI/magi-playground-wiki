@@ -7,10 +7,10 @@ MeTTa Playground sidecar for the Hyperon Wiki right column. Accepts MeTTa source
 ## Architecture
 
 ```
-Browser → POST /api/playground/run {code} → FastAPI → docker run hyperon-runtime:0.2.10 → JSON
+Browser → POST /api/playground/run {code} → FastAPI → docker create + start + rm hyperon-runtime:0.2.10 → JSON
 ```
 
-The FastAPI process is long-lived. Each request shells out to a fresh Docker container running the `hyperon-runtime:0.2.10` image (Python 3.11 + `hyperon==0.2.10`). The container is `--rm`, `--network=none`, `--read-only`, memory-capped, and timeout-killed.
+The FastAPI process is long-lived. Each request drives a fresh Docker container running the `hyperon-runtime:0.2.10` image (Python 3.11 + `hyperon==0.2.10`) through an explicit `docker create` → `docker start --attach --interactive` → `docker rm -f` lifecycle (see [Container lifecycle & cleanup](#container-lifecycle--cleanup-2026-06-30-oom-hardening)). The container is `--network=none`, `--read-only`, memory-capped, and timeout-killed.
 
 **V1 (current scope)**: ephemeral containers per request. No state retention between `Run` clicks.
 
@@ -25,16 +25,27 @@ The FastAPI process is long-lived. Each request shells out to a fresh Docker con
 ## Container lifecycle & cleanup (2026-06-30 OOM hardening)
 
 The 2026-06-30 prod outage was a memory-exhaustion/OOM cascade: a burst of playground
-requests left orphaned 256m containers that exhausted the ~3.7GiB, no-swap host. Root
-cause was relying on `docker run --rm` for timeout cleanup — `--rm` is performed by the
-**client** process, so SIGKILL-ing the `docker run` client (or crashing the worker)
-leaves the container running. The runner now defends in three layers:
+requests left orphaned 256m containers that exhausted the ~3.7GiB, no-swap host. The root
+cause was `docker run --rm`: `run` couples container creation to the CLI **client**'s
+lifecycle and `--rm` cleanup is the client's job — so cancelling/killing the client (client
+disconnect, worker restart) could leave the daemon creating a `Created` container that no
+cleanup handle could reliably catch. Successive hotfixes that shielded the spawn and
+retried `docker rm -f <name>` still lost the race (live smoke kept leaking `Created`
+containers). The runner now uses an **explicit lifecycle** so container existence is
+decoupled from the client:
 
-1. **Named + labelled containers.** Every container gets a unique `--name magi-pg-<uuid>`
-   plus ownership labels (`magi-playground.managed=true`, `magi-playground.created=<epoch>`).
-2. **Explicit force-removal on timeout/cancel/error.** Those paths run
-   `docker rm -f <name>` on the actual container instead of trusting `--rm`.
-3. **Background stale sweep.** A loop (startup + every `MAGI_CLEANUP_INTERVAL_S`)
+1. **`docker create` (no `--rm`).** Establishes the container up front with a unique
+   `--name magi-pg-<uuid>` and ownership labels (`magi-playground.managed=true`,
+   `magi-playground.created=<epoch>`). It returns only once the container definitively
+   exists.
+2. **`docker start --attach --interactive`.** Runs the user code, feeding stdin and
+   capturing the stdout JSON envelope / stderr.
+3. **Guaranteed removal.** Once `create` succeeds, *every* exit path — success, nonzero
+   exit, parse error, timeout, cancellation — reaches a `docker rm -f <name>` in a
+   `finally`. Because the container already exists by name, removal is deterministic, not a
+   heuristic. (Cancellation *during* `create` is the only create race left; it is shielded
+   and reaped by name.)
+4. **Background stale sweep.** A loop (startup + every `MAGI_CLEANUP_INTERVAL_S`)
    force-removes service-**labelled** containers older than `MAGI_STALE_CONTAINER_TTL_S`,
    reclaiming leaks from a crashed worker. The sweep filters on the ownership label, so it
    can never touch a container this service didn't create, and the TTL exceeds the max eval

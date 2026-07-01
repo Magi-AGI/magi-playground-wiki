@@ -56,8 +56,8 @@ class Settings:
 
     # Best-effort stale-container sweep: containers labelled as owned by THIS
     # service and older than this TTL are force-removed. Backstop for leaks from
-    # a crashed/restarted worker (where `docker run --rm` client-side cleanup
-    # never fires). Must comfortably exceed max_timeout_s so in-flight evals are
+    # a crashed/restarted worker (which would skip the per-request `docker rm -f`
+    # finally). Must comfortably exceed max_timeout_s so in-flight evals are
     # never reaped mid-run.
     stale_container_ttl_s: int = int(os.environ.get("MAGI_STALE_CONTAINER_TTL_S", "300"))
 

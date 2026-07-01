@@ -7,12 +7,21 @@ worst a malicious MeTTa program can do is consume its own CPU/memory budget
 until killed.
 
 Lifecycle / cleanup (hardened after the 2026-06-30 OOM incident):
-    * Every container gets a unique ``--name`` and ownership ``--label``s.
-    * ``docker run --rm`` handles the happy path, but ``--rm`` cleanup is done
-      by the *client* process — if we SIGKILL the client on timeout (or the
-      worker crashes) the container can be ORPHANED and keep its 256m. So
-      timeout/cancel/error paths explicitly ``docker rm -f <name>`` the
-      underlying container rather than trusting ``--rm``.
+    * We use an EXPLICIT ``create`` → ``start --attach`` → ``rm -f`` lifecycle
+      rather than ``docker run --rm``. The lesson from repeated live-cancellation
+      leaks (hotfixes 006/008/010) is that ``docker run`` couples container
+      creation to the client's lifecycle: cancel/kill the client and the daemon
+      can still create+leave an orphaned ``Created`` container that name-based
+      retry cleanup races and misses.
+    * ``docker create`` establishes the container up front and returns only once
+      it definitively exists (by our unique ``--name``). From that point every
+      exit path — success, nonzero exit, parse error, timeout, cancellation — is
+      guaranteed to reach a ``docker rm -f <name>`` in a ``finally``. Because the
+      container already exists, removal by name is deterministic, not a heuristic.
+    * ``docker start --attach --interactive`` runs the user code, feeding stdin
+      and capturing stdout (the JSON envelope) / stderr exactly as before.
+    * Cancellation *during* ``docker create`` is the only remaining create race;
+      it is shielded and, if it leaves a container, cleaned up by name.
     * A background sweep (`cleanup_stale_containers`) force-removes any
       service-labelled container older than a short TTL, as a backstop for
       leaks from a crashed worker.
@@ -44,16 +53,17 @@ LABEL_MANAGED: Final[str] = "magi-playground.managed"
 LABEL_CREATED: Final[str] = "magi-playground.created"  # int epoch seconds, set at run
 CONTAINER_NAME_PREFIX: Final[str] = "magi-pg-"
 
-# `docker rm -f` on the timeout/cancel path may race the daemon still creating
-# the container: bound how many times we retry a "No such container" before
+# `docker rm -f` may race the daemon still finishing a `docker create` on the
+# cancellation path: bound how many times we retry a "No such container" before
 # concluding it never materialised. Module-level so tests can shrink the delay.
 _RM_RETRY_ATTEMPTS: Final[int] = 4
 _RM_RETRY_DELAY_S: float = 0.25
 
+# `docker create` args (NOT `run`, and NO `--rm`): we manage the container's
+# whole lifecycle ourselves so cleanup never depends on the client process.
 DEFAULT_DOCKER_ARGS: Final[tuple[str, ...]] = (
-    "run",
-    "--rm",
-    "--interactive",          # stdin → container
+    "create",
+    "--interactive",          # keep stdin open for `start --attach --interactive`
     "--network=none",
     "--read-only",
     "--cap-drop=ALL",
@@ -89,8 +99,8 @@ def _container_name() -> str:
     return f"{CONTAINER_NAME_PREFIX}{uuid.uuid4().hex}"
 
 
-def _build_docker_command(name: str, timeout_s: float) -> list[str]:
-    """Build the docker-run argv for a single eval invocation."""
+def _build_docker_create_command(name: str, timeout_s: float) -> list[str]:
+    """Build the `docker create` argv for a single eval's sandbox container."""
     args: list[str] = [settings.docker_bin]
     args.extend(DEFAULT_DOCKER_ARGS)
     # Identity: unique name (for targeted removal) + ownership labels (for the
@@ -119,7 +129,8 @@ def _build_docker_command(name: str, timeout_s: float) -> list[str]:
 
 
 async def run_metta(code: str, timeout_s: float | None = None) -> RunResult:
-    """Spawn a one-shot container, feed `code` on stdin, parse the JSON envelope.
+    """Create a one-shot container, start it feeding `code` on stdin, parse the
+    JSON envelope, and ALWAYS remove the container afterwards.
 
     Concurrency is bounded by `MAGI_MAX_CONCURRENT_EVALS`; excess requests queue
     on the semaphore rather than over-committing host memory.
@@ -133,81 +144,84 @@ async def run_metta(code: str, timeout_s: float | None = None) -> RunResult:
     async with _get_semaphore():
         # Build the container identity AFTER admission through the semaphore, not
         # before. If we stamped LABEL_CREATED at queue-entry time, a request that
-        # waited behind the gate for longer than the stale TTL would launch a
+        # waited behind the gate for longer than the stale TTL would create a
         # brand-new container already carrying an "old" created label — and the
         # background sweep could reap a live eval. Stamping here means the label
-        # reflects actual container start time.
+        # reflects actual container creation time.
         name = _container_name()
-        argv = _build_docker_command(name, effective_timeout_s)
+        create_argv = _build_docker_create_command(name, effective_timeout_s)
         started = time.monotonic()
 
-        # Spawn `docker run` as a SHIELDED task. If the caller is cancelled while
-        # the spawn is still in flight, we must NOT cancel create_subprocess_exec
-        # itself — otherwise the docker-run client keeps going, creates the named
-        # container a moment later, and we're left with no `proc` handle to kill
-        # or drain it (the exact live-smoke 008 leak: three `Created` containers).
-        # Shielding lets the spawn finish so we can recover the real handle during
-        # cleanup and terminate the client + container properly.
-        proc: asyncio.subprocess.Process | None = None
-        spawn_task = asyncio.ensure_future(
-            asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        )
-        try:
-            proc = await asyncio.shield(spawn_task)
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(code.encode("utf-8")),
-                timeout=effective_timeout_s,
-            )
-        except asyncio.TimeoutError:
-            # Wall-clock exceeded (only reachable from wait_for, so `proc` exists).
-            # Killing the `docker run` CLIENT does not reliably stop the container,
-            # and with the client dead `--rm` never fires — so explicitly
-            # force-remove the named container. Shielded so a second cancellation
-            # mid-cleanup can't orphan the container.
-            await _cleanup_shielded(_terminate_container(proc, name))
-            elapsed_ms = int((time.monotonic() - started) * 1000)
+        # Phase 1 — create the container. Until this succeeds there is nothing to
+        # clean up; once it succeeds the container definitively exists by `name`.
+        create_error = await _create_container(name, create_argv)
+        if create_error is not None:
             return RunResult(
-                status="timeout",
+                status="error",
                 output="",
                 stdout="",
-                stderr=f"Evaluation exceeded {effective_timeout_s:.1f}s and was terminated.",
-                elapsed_ms=elapsed_ms,
+                stderr=f"Failed to create sandbox container.\n{create_error}".strip(),
+                elapsed_ms=int((time.monotonic() - started) * 1000),
             )
-        except BaseException:
-            # Request cancelled (client disconnect → CancelledError) or any other
-            # failure. Clean up before propagating so we never leak a container,
-            # shielded so cleanup completes even if another cancellation arrives.
-            if proc is None:
-                # Cancelled/failed while the spawn was still running. Give the
-                # shielded spawn a bounded chance to hand us the real client
-                # handle so we can kill/drain it, instead of blindly rm-ing a
-                # name whose container may not exist yet.
-                proc = await _await_spawn_after_cancellation(spawn_task)
-            if proc is not None:
-                # Client handle exists: kill it AND force-remove the container.
-                await _cleanup_shielded(_terminate_container(proc, name))
-            else:
-                # No handle ever materialised (spawn failed or exceeded the wait).
-                # The daemon may still have created the container — reap it by name
-                # with the long not-found retry window as a last resort.
-                await _cleanup_shielded(
-                    _force_remove_container(name, retry_not_found=True)
-                )
-            raise
+
+        # Phase 2 — start + attach. The container now exists, so EVERY path below
+        # (return, raise, timeout) removes it via the `finally`. Removal by name
+        # is deterministic here: no daemon-create race can leave an orphan.
+        try:
+            return await _start_and_collect(code, name, effective_timeout_s, started)
+        finally:
+            await _cleanup_shielded(_force_remove_container(name))
+
+
+async def _start_and_collect(
+    code: str, name: str, effective_timeout_s: float, started: float
+) -> RunResult:
+    """`docker start --attach` the (already-created) container and build a result.
+
+    The caller's `finally` guarantees the container is removed regardless of how
+    this returns/raises, so here we only kill/drain the start CLIENT on the
+    timeout/cancel paths (killing the client stops the attached run; the force
+    kill of any still-running container is handled by the caller's `rm -f`).
+    """
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            settings.docker_bin,
+            "start",
+            "--attach",
+            "--interactive",
+            name,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(code.encode("utf-8")),
+            timeout=effective_timeout_s,
+        )
+    except asyncio.TimeoutError:
+        # Wall-clock exceeded (only reachable from wait_for, so `proc` exists).
+        await _kill_and_drain(proc)
+        return RunResult(
+            status="timeout",
+            output="",
+            stdout="",
+            stderr=f"Evaluation exceeded {effective_timeout_s:.1f}s and was terminated.",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+    except BaseException:
+        # Cancelled (client disconnect) or unexpected error. Kill/drain the start
+        # client if we have it; the caller's `finally` removes the container.
+        if proc is not None:
+            await _kill_and_drain(proc)
+        raise
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
-
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr_raw = stderr_bytes.decode("utf-8", errors="replace")
 
     if proc.returncode != 0:
-        # Container exited non-zero (sandbox kill, OOM, docker-run failure). The
-        # client exited normally here, so `--rm` already removed the container.
+        # Container exited non-zero (sandbox kill, OOM, start failure).
         # Distinguish OOM from generic error if we can tell from stderr/exit code.
         oom = "killed" in stderr_raw.lower() or proc.returncode == 137
         return RunResult(
@@ -244,6 +258,50 @@ async def run_metta(code: str, timeout_s: float | None = None) -> RunResult:
     )
 
 
+async def _create_container(name: str, create_argv: list[str]) -> str | None:
+    """Run `docker create`, shielded against cancellation. Returns None on success
+    (the container now exists by `name`), or an error string on failure.
+
+    If cancellation races the create, the shielded create is allowed to settle so
+    we can tell whether it produced a container; either way we force-remove by
+    name (with not-found retry, covering the create tail) before re-raising.
+    """
+    create_task = asyncio.ensure_future(
+        asyncio.create_subprocess_exec(
+            *create_argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await asyncio.shield(create_task)
+        _out_bytes, err_bytes = await proc.communicate()
+    except BaseException:
+        # Cancelled/failed during create. Recover the shielded create client if
+        # it materialised, stop it, then force-remove by name in case the daemon
+        # did create the container. Then propagate.
+        if proc is None:
+            proc = await _await_spawn_after_cancellation(create_task)
+        if proc is not None:
+            with _suppress_async_errors():
+                proc.kill()
+            with _suppress_async_errors():
+                await asyncio.wait_for(
+                    proc.communicate(), timeout=settings.cleanup_op_timeout_s
+                )
+        await _cleanup_shielded(_force_remove_container(name, retry_not_found=True))
+        raise
+
+    if proc.returncode != 0:
+        return (
+            err_bytes.decode("utf-8", errors="replace").strip()
+            or f"docker create exited with code {proc.returncode}"
+        )
+    return None
+
+
 async def _cleanup_shielded(coro) -> None:
     """Run `coro` (a cleanup coroutine) to completion even under cancellation.
 
@@ -274,14 +332,14 @@ async def _cleanup_shielded(coro) -> None:
 async def _await_spawn_after_cancellation(
     spawn_task: asyncio.Future,
 ) -> asyncio.subprocess.Process | None:
-    """Recover the docker-run client handle after cancellation raced the spawn.
+    """Recover a docker client handle after cancellation raced its spawn.
 
-    The caller was cancelled while `create_subprocess_exec` was still in flight;
-    because that spawn was shielded, it keeps running and will hand back a real
-    Process handle shortly. We wait for it — bounded by `cleanup_op_timeout_s`,
-    absorbing any repeat cancellations — so cleanup can kill/drain the client and
-    force-remove the container, rather than blindly rm-ing a not-yet-existing
-    name. Returns the Process, or None if the spawn never yields a usable handle
+    The caller was cancelled while `create_subprocess_exec` (for `docker create`)
+    was still in flight; because that spawn was shielded, it keeps running and
+    will hand back a real Process handle shortly. We wait for it — bounded by
+    `cleanup_op_timeout_s`, absorbing any repeat cancellations — so cleanup can
+    kill/drain the client, rather than acting on a handle that never arrives.
+    Returns the Process, or None if the spawn never yields a usable handle
     (failed, was itself cancelled, or exceeded the bound). Never raises.
     """
     deadline = time.monotonic() + settings.cleanup_op_timeout_s
@@ -319,22 +377,18 @@ async def _await_spawn_after_cancellation(
     return spawn_task.result()
 
 
-async def _terminate_container(proc: asyncio.subprocess.Process, name: str) -> None:
-    """Kill the docker-run client AND force-remove the underlying container.
+async def _kill_and_drain(proc: asyncio.subprocess.Process) -> None:
+    """Kill a docker-start client and drain its pipes (bounded). Never raises.
 
-    Called on the timeout / cancellation / error paths. `proc.kill()` alone only
-    targets the CLI client; `docker rm -f <name>` is what actually reclaims the
-    container's memory. The removal retries on "No such container" because the
-    daemon may still be CREATING the named container when we kill the client —
-    a single early not-found is not proof the container will never exist.
+    This stops the attached run; the container itself is removed separately by
+    the caller's `docker rm -f <name>` (which force-kills it if still running).
     """
     with _suppress_async_errors():
         proc.kill()
     # Drain the client's pipes so it can exit and we don't leak fds. Bounded so a
-    # wedged client can't hang us; the force-remove below is the real cleanup.
+    # wedged client can't hang us.
     with _suppress_async_errors():
         await asyncio.wait_for(proc.communicate(), timeout=settings.cleanup_op_timeout_s)
-    await _force_remove_container(name, retry_not_found=True)
 
 
 def _is_not_found(stderr: str) -> bool:
