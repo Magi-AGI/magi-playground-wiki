@@ -22,6 +22,28 @@ The FastAPI process is long-lived. Each request shells out to a fresh Docker con
 - **I-5**: Hard 5s wall clock + 256MB memory cap per eval. Enforced by Docker `--memory` + `--stop-timeout`.
 - **I-9**: Reversible. If this sidecar is stopped, the wiki's `setupCodePlayground` JS falls back to canned `[Result of …]` outputs.
 
+## Container lifecycle & cleanup (2026-06-30 OOM hardening)
+
+The 2026-06-30 prod outage was a memory-exhaustion/OOM cascade: a burst of playground
+requests left orphaned 256m containers that exhausted the ~3.7GiB, no-swap host. Root
+cause was relying on `docker run --rm` for timeout cleanup — `--rm` is performed by the
+**client** process, so SIGKILL-ing the `docker run` client (or crashing the worker)
+leaves the container running. The runner now defends in three layers:
+
+1. **Named + labelled containers.** Every container gets a unique `--name magi-pg-<uuid>`
+   plus ownership labels (`magi-playground.managed=true`, `magi-playground.created=<epoch>`).
+2. **Explicit force-removal on timeout/cancel/error.** Those paths run
+   `docker rm -f <name>` on the actual container instead of trusting `--rm`.
+3. **Background stale sweep.** A loop (startup + every `MAGI_CLEANUP_INTERVAL_S`)
+   force-removes service-**labelled** containers older than `MAGI_STALE_CONTAINER_TTL_S`,
+   reclaiming leaks from a crashed worker. The sweep filters on the ownership label, so it
+   can never touch a container this service didn't create, and the TTL exceeds the max eval
+   timeout so in-flight evals are never reaped.
+
+An **`asyncio.Semaphore`** caps simultaneous evals at `MAGI_MAX_CONCURRENT_EVALS`
+(default 4 ≈ 1GiB peak); excess requests queue rather than over-committing host RAM.
+All settings live in `app/config.py` / `.env.example`.
+
 ## Hyperon 0.2.x runtime quirks
 
 Users hitting these behaviors are encountering language semantics, not bugs:
@@ -108,7 +130,7 @@ Runs as a systemd service on the EC2 host alongside Decko/Nginx. Each request sh
 
 | File | Purpose |
 |------|---------|
-| [`magi-playground-wiki.service`](./deploy/magi-playground-wiki.service) | systemd unit — uvicorn under user `magi-playground` (in `docker` group), 2 workers, hardened |
+| [`magi-playground-wiki.service`](./deploy/magi-playground-wiki.service) | systemd unit — uvicorn under user `magi-playground` (in `docker` group), 1 worker, hardened |
 | [`nginx-rate-limits.conf`](./deploy/nginx-rate-limits.conf) | `http {}`-level rate-limit zones (tiered, 60/min signed-in, 30/min anon) |
 | [`nginx-playground.conf`](./deploy/nginx-playground.conf) | `server {}`-level location block (15s read timeout, 128k body cap) |
 | [`deploy.sh`](./deploy/deploy.sh) | idempotent install/update: git pull → docker build (when runtime/ changed) → venv pip install → restart → health-check |

@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+# Not adopting a uv lockfile workflow (deploy uses `pip install -e .`); `uv run`
+# regenerates this locally, so keep it out of the tree rather than tracking it.
+uv.lock
 .env
 .env.*
 !.env.example

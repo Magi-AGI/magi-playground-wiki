@@ -8,6 +8,8 @@ Exposes:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -18,7 +20,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 
 from .config import settings
 from .models import HealthResponse, RunRequest, RunResponse
-from .runner import run_metta
+from .runner import cleanup_stale_containers, run_metta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger(__name__)
@@ -39,16 +41,42 @@ metta_eval_duration_seconds = Histogram(
 )
 
 
+async def _stale_cleanup_loop() -> None:
+    """Periodically reap orphaned service-owned containers.
+
+    Runs an immediate sweep on startup (reclaims leaks from a previously-crashed
+    worker) then every `cleanup_interval_s`. Each sweep is best-effort and only
+    targets this service's labelled containers older than the stale TTL.
+    """
+    while True:
+        try:
+            await cleanup_stale_containers()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — keep the loop alive across any failure
+            log.exception("stale-container sweep iteration failed")
+        await asyncio.sleep(settings.cleanup_interval_s)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info(
-        "magi-playground-wiki starting (image=%s, default_timeout=%.1fs, memory=%s)",
+        "magi-playground-wiki starting (image=%s, default_timeout=%.1fs, memory=%s, "
+        "max_concurrent=%d, stale_ttl=%ds)",
         settings.runtime_image,
         settings.default_timeout_s,
         settings.memory_limit,
+        settings.max_concurrent_evals,
+        settings.stale_container_ttl_s,
     )
-    yield
-    log.info("magi-playground-wiki shutting down")
+    cleanup_task = asyncio.create_task(_stale_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup_task
+        log.info("magi-playground-wiki shutting down")
 
 
 app = FastAPI(
