@@ -236,8 +236,8 @@ async def test_normal_lifecycle_create_start_remove(monkeypatch) -> None:
 
 
 async def test_create_failure_returns_error_and_no_leak(monkeypatch) -> None:
-    """If `docker create` fails, we surface an error and never start/rm (nothing
-    was created)."""
+    """If `docker create` fails, surface an error, never start, and still issue a
+    defensive rm-by-name in case the daemon partially created the container."""
     recorder = SpawnRecorder(
         create_proc_factory=lambda: FakeProc(
             mode="exit", stderr=b"docker: bad flag", returncode=125
@@ -249,7 +249,7 @@ async def test_create_failure_returns_error_and_no_leak(monkeypatch) -> None:
     assert result.status == "error"
     assert "bad flag" in result.stderr
     assert _count(recorder, "start") == 0
-    assert recorder.removed == []
+    assert recorder.removed == [_name(recorder)]
 
 
 async def test_timeout_kills_start_and_removes(monkeypatch) -> None:

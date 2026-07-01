@@ -262,9 +262,11 @@ async def _create_container(name: str, create_argv: list[str]) -> str | None:
     """Run `docker create`, shielded against cancellation. Returns None on success
     (the container now exists by `name`), or an error string on failure.
 
-    If cancellation races the create, the shielded create is allowed to settle so
-    we can tell whether it produced a container; either way we force-remove by
-    name (with not-found retry, covering the create tail) before re-raising.
+    If caller cancellation races the create, do NOT abandon the docker client:
+    keep waiting for create + communicate to settle, then remove by name if a
+    container may have been produced, and only then re-raise cancellation. This
+    deliberately favors not leaking containers over promptly aborting the short
+    create phase.
     """
     create_task = asyncio.ensure_future(
         asyncio.create_subprocess_exec(
@@ -274,32 +276,70 @@ async def _create_container(name: str, create_argv: list[str]) -> str | None:
             stderr=asyncio.subprocess.PIPE,
         )
     )
-    proc: asyncio.subprocess.Process | None = None
+    caller_cancelled = False
     try:
-        proc = await asyncio.shield(create_task)
-        _out_bytes, err_bytes = await proc.communicate()
+        proc, was_cancelled = await _await_shielded_to_completion(create_task)
+        caller_cancelled = caller_cancelled or was_cancelled
     except BaseException:
-        # Cancelled/failed during create. Recover the shielded create client if
-        # it materialised, stop it, then force-remove by name in case the daemon
-        # did create the container. Then propagate.
-        if proc is None:
-            proc = await _await_spawn_after_cancellation(create_task)
-        if proc is not None:
-            with _suppress_async_errors():
-                proc.kill()
-            with _suppress_async_errors():
-                await asyncio.wait_for(
-                    proc.communicate(), timeout=settings.cleanup_op_timeout_s
-                )
+        # Spawn failed or the underlying create task itself was cancelled. There
+        # probably is no container, but rm-by-name is cheap and covers partial
+        # daemon-side creation.
         await _cleanup_shielded(_force_remove_container(name, retry_not_found=True))
         raise
 
+    communicate_task = asyncio.ensure_future(proc.communicate())
+    try:
+        (_out_bytes, err_bytes), was_cancelled = await _await_shielded_to_completion(
+            communicate_task
+        )
+        caller_cancelled = caller_cancelled or was_cancelled
+    except BaseException:
+        # If create's client misbehaves during communicate, stop it and remove by
+        # name before propagating. This is not expected in normal docker create,
+        # but it keeps the invariant simple.
+        with _suppress_async_errors():
+            proc.kill()
+        with _suppress_async_errors():
+            await asyncio.wait_for(proc.communicate(), timeout=settings.cleanup_op_timeout_s)
+        await _cleanup_shielded(_force_remove_container(name, retry_not_found=True))
+        raise
+
+    if caller_cancelled:
+        # The user/request went away while create was in progress. If create
+        # succeeded, the container exists; if it failed after partial daemon work,
+        # this rm is still a safe backstop. Re-raise cancellation after cleanup.
+        await _cleanup_shielded(_force_remove_container(name, retry_not_found=True))
+        raise asyncio.CancelledError
+
     if proc.returncode != 0:
+        # Defensive: docker create normally creates nothing on failure, but if the
+        # daemon partially created a named container, remove it before returning.
+        await _force_remove_container(name, retry_not_found=True)
         return (
             err_bytes.decode("utf-8", errors="replace").strip()
             or f"docker create exited with code {proc.returncode}"
         )
     return None
+
+
+async def _await_shielded_to_completion(task: asyncio.Future):
+    """Await a shielded task until it completes, absorbing caller cancellation.
+
+    Returns ``(result, caller_cancelled)``. If the underlying task raises or is
+    itself cancelled, that exception is propagated. This is intentionally
+    unbounded: it is used only for short docker client creation/communication
+    phases where abandoning the task has repeatedly produced orphan containers.
+    """
+    caller_cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), caller_cancelled
+        except asyncio.CancelledError:
+            if task.done():
+                # Underlying task, not just the caller, was cancelled.
+                raise
+            caller_cancelled = True
+            continue
 
 
 async def _cleanup_shielded(coro) -> None:
