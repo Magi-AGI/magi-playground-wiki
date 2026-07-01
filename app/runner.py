@@ -140,23 +140,31 @@ async def run_metta(code: str, timeout_s: float | None = None) -> RunResult:
         name = _container_name()
         argv = _build_docker_command(name, effective_timeout_s)
         started = time.monotonic()
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
 
+        # `proc` must be None-initialised BEFORE the spawn await: if cancellation
+        # arrives *during* create_subprocess_exec, the Docker daemon may already
+        # have created the named container even though Python never received the
+        # `proc` handle. The spawn is therefore inside the try so that path still
+        # force-removes the container by name (live smoke 006 leaked a `Created`
+        # container exactly here).
+        proc: asyncio.subprocess.Process | None = None
         try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(code.encode("utf-8")),
                 timeout=effective_timeout_s,
             )
         except asyncio.TimeoutError:
-            # Wall-clock exceeded. Killing the `docker run` CLIENT does not reliably
-            # stop the container, and with the client dead `--rm` never fires — so
-            # explicitly force-remove the named container. Shielded so a second
-            # cancellation mid-cleanup can't orphan the container.
+            # Wall-clock exceeded (only reachable from wait_for, so `proc` exists).
+            # Killing the `docker run` CLIENT does not reliably stop the container,
+            # and with the client dead `--rm` never fires — so explicitly
+            # force-remove the named container. Shielded so a second cancellation
+            # mid-cleanup can't orphan the container.
             await _cleanup_shielded(_terminate_container(proc, name))
             elapsed_ms = int((time.monotonic() - started) * 1000)
             return RunResult(
@@ -168,10 +176,18 @@ async def run_metta(code: str, timeout_s: float | None = None) -> RunResult:
             )
         except BaseException:
             # Request cancelled (client disconnect → CancelledError) or any other
-            # failure while awaiting the container: clean up the container before
-            # propagating so we never leak it. Shielded so the cleanup runs to
-            # completion even if another cancellation arrives.
-            await _cleanup_shielded(_terminate_container(proc, name))
+            # failure. Clean up before propagating so we never leak a container,
+            # shielded so cleanup completes even if another cancellation arrives.
+            if proc is not None:
+                # Client handle exists: kill it AND force-remove the container.
+                await _cleanup_shielded(_terminate_container(proc, name))
+            else:
+                # Cancelled/failed inside create_subprocess_exec — no client handle,
+                # but the daemon may have created the container. Reap it by name
+                # (with not-found retry, since it may still be materialising).
+                await _cleanup_shielded(
+                    _force_remove_container(name, retry_not_found=True)
+                )
             raise
 
     elapsed_ms = int((time.monotonic() - started) * 1000)

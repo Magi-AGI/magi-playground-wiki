@@ -88,10 +88,15 @@ class SpawnRecorder:
         run_proc_factory,
         ps_output: bytes = b"",
         rm_responses: list[tuple[int, bytes]] | None = None,
+        run_raises: BaseException | None = None,
     ) -> None:
         self._run_proc_factory = run_proc_factory
         self._ps_output = ps_output
         self._rm_responses = list(rm_responses or [])
+        # If set, the `docker run` spawn records its argv (so the name is
+        # observable) and then RAISES — simulating cancellation/error arriving
+        # mid create_subprocess_exec after the daemon created the container.
+        self._run_raises = run_raises
         self.calls: list[list[str]] = []
         self.removed: list[str] = []
 
@@ -101,6 +106,8 @@ class SpawnRecorder:
         # argv[0] is the docker binary; argv[1] is the subcommand.
         sub = argv_list[1] if len(argv_list) > 1 else ""
         if sub == "run":
+            if self._run_raises is not None:
+                raise self._run_raises
             return self._run_proc_factory()
         if sub == "rm":
             # docker rm -f <name>  → record the target name.
@@ -194,6 +201,33 @@ async def test_cancellation_cleans_up_and_propagates(monkeypatch) -> None:
     argv = _run_argv(recorder)
     name = argv[argv.index("--name") + 1]
     assert recorder.removed == [name]
+
+
+async def test_cancellation_during_spawn_reaps_container(monkeypatch) -> None:
+    """HOTFIX 006: cancellation *inside* create_subprocess_exec (after the daemon
+    created the named container, before Python got the proc handle) must still
+    force-remove the container by name — with not-found retry, since it may still
+    be materialising — and re-raise the cancellation."""
+    monkeypatch.setattr(runner, "_RM_RETRY_DELAY_S", 0)
+    recorder = SpawnRecorder(
+        run_proc_factory=lambda: None,  # unused: the run spawn raises instead
+        run_raises=asyncio.CancelledError(),
+        # Container materialised late: first rm not-found, retry succeeds.
+        rm_responses=[
+            (1, b"Error: No such container: magi-pg-spawn"),
+            (0, b""),
+        ],
+    )
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", recorder)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run_metta("!(x)")
+
+    # The run argv was recorded before the raise, so we know the intended name.
+    argv = _run_argv(recorder)
+    name = argv[argv.index("--name") + 1]
+    # Force-removed by name, retrying past the initial not-found → two attempts.
+    assert recorder.removed == [name, name]
 
 
 async def test_clean_exit_does_not_force_remove(monkeypatch) -> None:
