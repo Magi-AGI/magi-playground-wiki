@@ -141,20 +141,24 @@ async def run_metta(code: str, timeout_s: float | None = None) -> RunResult:
         argv = _build_docker_command(name, effective_timeout_s)
         started = time.monotonic()
 
-        # `proc` must be None-initialised BEFORE the spawn await: if cancellation
-        # arrives *during* create_subprocess_exec, the Docker daemon may already
-        # have created the named container even though Python never received the
-        # `proc` handle. The spawn is therefore inside the try so that path still
-        # force-removes the container by name (live smoke 006 leaked a `Created`
-        # container exactly here).
+        # Spawn `docker run` as a SHIELDED task. If the caller is cancelled while
+        # the spawn is still in flight, we must NOT cancel create_subprocess_exec
+        # itself — otherwise the docker-run client keeps going, creates the named
+        # container a moment later, and we're left with no `proc` handle to kill
+        # or drain it (the exact live-smoke 008 leak: three `Created` containers).
+        # Shielding lets the spawn finish so we can recover the real handle during
+        # cleanup and terminate the client + container properly.
         proc: asyncio.subprocess.Process | None = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
+        spawn_task = asyncio.ensure_future(
+            asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+        )
+        try:
+            proc = await asyncio.shield(spawn_task)
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(code.encode("utf-8")),
                 timeout=effective_timeout_s,
@@ -178,13 +182,19 @@ async def run_metta(code: str, timeout_s: float | None = None) -> RunResult:
             # Request cancelled (client disconnect → CancelledError) or any other
             # failure. Clean up before propagating so we never leak a container,
             # shielded so cleanup completes even if another cancellation arrives.
+            if proc is None:
+                # Cancelled/failed while the spawn was still running. Give the
+                # shielded spawn a bounded chance to hand us the real client
+                # handle so we can kill/drain it, instead of blindly rm-ing a
+                # name whose container may not exist yet.
+                proc = await _await_spawn_after_cancellation(spawn_task)
             if proc is not None:
                 # Client handle exists: kill it AND force-remove the container.
                 await _cleanup_shielded(_terminate_container(proc, name))
             else:
-                # Cancelled/failed inside create_subprocess_exec — no client handle,
-                # but the daemon may have created the container. Reap it by name
-                # (with not-found retry, since it may still be materialising).
+                # No handle ever materialised (spawn failed or exceeded the wait).
+                # The daemon may still have created the container — reap it by name
+                # with the long not-found retry window as a last resort.
                 await _cleanup_shielded(
                     _force_remove_container(name, retry_not_found=True)
                 )
@@ -259,6 +269,54 @@ async def _cleanup_shielded(coro) -> None:
             break
     if caller_cancelled:
         raise asyncio.CancelledError
+
+
+async def _await_spawn_after_cancellation(
+    spawn_task: asyncio.Future,
+) -> asyncio.subprocess.Process | None:
+    """Recover the docker-run client handle after cancellation raced the spawn.
+
+    The caller was cancelled while `create_subprocess_exec` was still in flight;
+    because that spawn was shielded, it keeps running and will hand back a real
+    Process handle shortly. We wait for it — bounded by `cleanup_op_timeout_s`,
+    absorbing any repeat cancellations — so cleanup can kill/drain the client and
+    force-remove the container, rather than blindly rm-ing a not-yet-existing
+    name. Returns the Process, or None if the spawn never yields a usable handle
+    (failed, was itself cancelled, or exceeded the bound). Never raises.
+    """
+    deadline = time.monotonic() + settings.cleanup_op_timeout_s
+    while not spawn_task.done():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            # Shield again: neither our timeout nor a repeat cancellation may
+            # cancel the underlying spawn.
+            await asyncio.wait_for(asyncio.shield(spawn_task), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+        except asyncio.CancelledError:
+            # Either our wait was cancelled (spawn still running → loop) or the
+            # spawn task itself finished as cancelled (loop guard then exits).
+            continue
+        except Exception:  # noqa: BLE001 — spawn failed; state is inspected below
+            break
+
+    if not spawn_task.done():
+        log.warning(
+            "spawn did not return a process handle within %.1fs; "
+            "falling back to force-remove by name",
+            settings.cleanup_op_timeout_s,
+        )
+        return None
+    if spawn_task.cancelled():
+        log.debug("spawn task was cancelled; no process handle to terminate")
+        return None
+    exc = spawn_task.exception()
+    if exc is not None:
+        log.debug("spawn task failed during cancellation cleanup: %s", exc)
+        return None
+    return spawn_task.result()
 
 
 async def _terminate_container(proc: asyncio.subprocess.Process, name: str) -> None:

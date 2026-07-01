@@ -89,6 +89,8 @@ class SpawnRecorder:
         ps_output: bytes = b"",
         rm_responses: list[tuple[int, bytes]] | None = None,
         run_raises: BaseException | None = None,
+        run_started: "asyncio.Event | None" = None,
+        run_release: "asyncio.Event | None" = None,
     ) -> None:
         self._run_proc_factory = run_proc_factory
         self._ps_output = ps_output
@@ -97,6 +99,12 @@ class SpawnRecorder:
         # observable) and then RAISES — simulating cancellation/error arriving
         # mid create_subprocess_exec after the daemon created the container.
         self._run_raises = run_raises
+        # `run_started` is set when the spawn coroutine begins; `run_release`, if
+        # provided, is awaited before the spawn returns — letting a test cancel
+        # the caller while the spawn is still in flight, then release it so the
+        # spawn returns a handle LATE (the live-smoke 008 scenario).
+        self._run_started = run_started
+        self._run_release = run_release
         self.calls: list[list[str]] = []
         self.removed: list[str] = []
 
@@ -106,6 +114,10 @@ class SpawnRecorder:
         # argv[0] is the docker binary; argv[1] is the subcommand.
         sub = argv_list[1] if len(argv_list) > 1 else ""
         if sub == "run":
+            if self._run_started is not None:
+                self._run_started.set()
+            if self._run_release is not None:
+                await self._run_release.wait()
             if self._run_raises is not None:
                 raise self._run_raises
             return self._run_proc_factory()
@@ -203,11 +215,44 @@ async def test_cancellation_cleans_up_and_propagates(monkeypatch) -> None:
     assert recorder.removed == [name]
 
 
-async def test_cancellation_during_spawn_reaps_container(monkeypatch) -> None:
-    """HOTFIX 006: cancellation *inside* create_subprocess_exec (after the daemon
-    created the named container, before Python got the proc handle) must still
-    force-remove the container by name — with not-found retry, since it may still
-    be materialising — and re-raise the cancellation."""
+async def test_cancellation_during_spawn_recovers_handle_and_terminates(monkeypatch) -> None:
+    """HOTFIX 008: cancellation while the docker-run spawn is STILL IN FLIGHT must
+    not abandon it. The shielded spawn returns its client handle LATE; cleanup
+    recovers that handle, kills/drains the client, and force-removes the
+    container — then re-raises CancelledError."""
+    run_started = asyncio.Event()
+    run_release = asyncio.Event()
+    fake = FakeProc(mode="hang")
+    recorder = SpawnRecorder(
+        run_proc_factory=lambda: fake,
+        run_started=run_started,
+        run_release=run_release,
+        rm_responses=[(0, b"")],
+    )
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", recorder)
+
+    task = asyncio.create_task(runner.run_metta("!(x)"))
+    await run_started.wait()  # spawn is in flight (proc handle not yet returned)
+    task.cancel()
+    # Let the cancellation be delivered at the shielded-spawn await while proc is
+    # still None, THEN let the spawn complete and hand back the late handle.
+    await asyncio.sleep(0.02)
+    run_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The recovered client handle was killed, and the container force-removed.
+    assert fake.killed is True
+    argv = _run_argv(recorder)
+    name = argv[argv.index("--name") + 1]
+    assert name in recorder.removed
+
+
+async def test_cancellation_during_spawn_no_handle_reaps_by_name(monkeypatch) -> None:
+    """HOTFIX 006/008 fallback: if the spawn never yields a usable handle (it
+    fails outright), cleanup still force-removes the container by name, retrying
+    past an initial not-found in case the daemon materialised it late."""
     monkeypatch.setattr(runner, "_RM_RETRY_DELAY_S", 0)
     recorder = SpawnRecorder(
         run_proc_factory=lambda: None,  # unused: the run spawn raises instead
